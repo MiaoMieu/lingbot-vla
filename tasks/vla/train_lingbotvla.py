@@ -20,7 +20,7 @@ from lingbotvla.data import (
     VLADataCollatorWithPacking,
     build_dataloader,
 )
-from lingbotvla.data.vla_data import liberoDataset, RobotwinDataset, CustomizedRobotwinDataset
+from lingbotvla.data.vla_data import liberoDataset, RobotwinDataset, CustomizedRobotwinDataset, AgibotDataset
 from lingbotvla.distributed.offloading import build_activation_offloading_context
 from lingbotvla.distributed.parallel_state import get_parallel_state, init_parallel_state
 from lingbotvla.distributed.torch_parallelize import build_parallelize_model
@@ -213,6 +213,10 @@ class MyDataArguments(DataArguments):
         default=None,
         metadata={"help": "Path to the normalization stats file."},
     )
+    use_waist: bool = field(
+        default=True,
+        metadata={"help": "Whether to include waist joint in Agibot state/action."},
+    )
 
 
 @dataclass
@@ -325,10 +329,41 @@ def main():
         if args.data.datasets_type == 'vla':
             logger.info_rank0("Start building VLA dataset")
             args.data.chunk_size = args.train.chunk_size
-            if args.data.data_name == 'libero':
-                train_dataset = liberoDataset(repo_id=args.data.train_path, config=model.config, tokenizer=processor.tokenizer, data_config=args.data, image_processor=processor.image_processor if 'qwen' in args.model.tokenizer_path.lower() else None,use_depth_align=use_depth_align)
-            elif 'robotwin' in args.data.data_name.lower():
-                train_dataset = RobotwinDataset(repo_id=args.data.train_path, config=model.config, tokenizer=processor.tokenizer, data_config=args.data, image_processor=processor.image_processor if 'qwen' in args.model.tokenizer_path.lower() else None, use_depth_align=use_depth_align)
+            image_proc = processor.image_processor if 'qwen' in args.model.tokenizer_path.lower() else None
+            common_kwargs = dict(config=model.config, tokenizer=processor.tokenizer, data_config=args.data, image_processor=image_proc, use_depth_align=use_depth_align)
+
+            train_paths = [p.strip() for p in args.data.train_path.split(",")]
+            data_names = [n.strip() for n in args.data.data_name.split(",")]
+            norm_stats_files = [f.strip() for f in args.data.norm_stats_file.split(",")] if args.data.norm_stats_file else [None]
+            if len(data_names) == 1 and len(train_paths) > 1:
+                data_names = data_names * len(train_paths)
+            if len(norm_stats_files) == 1 and len(train_paths) > 1:
+                norm_stats_files = norm_stats_files * len(train_paths)
+
+            datasets = []
+            for dname, dpath, nfile in zip(data_names, train_paths, norm_stats_files):
+                per_ds_config = deepcopy(args.data)
+                per_ds_config.norm_stats_file = nfile
+                per_ds_kwargs = dict(config=model.config, tokenizer=processor.tokenizer, data_config=per_ds_config, image_processor=image_proc, use_depth_align=use_depth_align)
+                dname_lower = dname.lower()
+                if dname_lower == 'libero':
+                    ds = liberoDataset(repo_id=dpath, **per_ds_kwargs)
+                elif 'agibot' in dname_lower:
+                    ds = AgibotDataset(repo_id=dpath, **per_ds_kwargs)
+                elif 'robotwin' in dname_lower:
+                    ds = RobotwinDataset(repo_id=dpath, **per_ds_kwargs)
+                else:
+                    raise ValueError(f"Unknown data_name: {dname}")
+                logger.info_rank0(f"  loaded {dname} from {dpath} (norm={nfile}): {len(ds)} samples")
+                datasets.append(ds)
+
+            if len(datasets) == 1:
+                train_dataset = datasets[0]
+            else:
+                from torch.utils.data import ConcatDataset
+                train_dataset = ConcatDataset(datasets)
+                logger.info_rank0(f"  ConcatDataset total: {len(train_dataset)} samples")
+
             args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, len(train_dataset))
         
         train_dataloader = build_dataloader(
@@ -545,6 +580,25 @@ def main():
 
             if global_step == 1:
                 helper.print_example(example=micro_batches[0], rank=args.train.local_rank)
+
+            if global_step <= 2 and args.train.local_rank == 0:
+                mb = micro_batches[0]
+                logger.info_rank0("=" * 60)
+                logger.info_rank0(f"[DATA CHECK] global_step={global_step}")
+                for k, v in mb.items():
+                    if isinstance(v, torch.Tensor):
+                        logger.info_rank0(f"  {k:20s}  shape={str(list(v.shape)):20s}  dtype={v.dtype}  min={v.min().item():.4f}  max={v.max().item():.4f}  mean={v.float().mean().item():.4f}")
+                    elif isinstance(v, dict):
+                        for sk, sv in v.items():
+                            if isinstance(sv, torch.Tensor):
+                                logger.info_rank0(f"  {k}.{sk:14s}  shape={str(list(sv.shape)):20s}  dtype={sv.dtype}  min={sv.min().item():.4f}  max={sv.max().item():.4f}")
+                            else:
+                                logger.info_rank0(f"  {k}.{sk:14s}  type={type(sv).__name__}  value={sv}")
+                    elif isinstance(v, list):
+                        logger.info_rank0(f"  {k:20s}  list[{len(v)}]  first={v[0] if v else 'empty'}")
+                    else:
+                        logger.info_rank0(f"  {k:20s}  type={type(v).__name__}  value={v}")
+                logger.info_rank0("=" * 60)
 
             total_loss = 0
             total_vla_loss = 0
@@ -800,4 +854,10 @@ def main():
 
 
 if __name__ == "__main__":
+    import sys
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    _project_root = os.path.abspath(os.path.join(_script_dir, "..", ".."))
+    _default_config = os.path.join(_project_root, "configs", "vla", "agibot_pick_block.yaml")
+    if len(sys.argv) == 1 or (len(sys.argv) > 1 and not sys.argv[1].endswith((".yaml", ".yml", ".json"))):
+        sys.argv.insert(1, _default_config)
     main()
